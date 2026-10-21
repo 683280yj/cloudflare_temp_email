@@ -1,0 +1,38 @@
+name: Cloudflare shutdown checks
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read routing and recovery metadata
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: python
+        run: |
+          import os,json,urllib.request,urllib.error
+          token=os.environ["CF_TOKEN"];account=os.environ["CF_ACCOUNT"]
+          base="https://api.cloudflare.com/client/v4/accounts/"+account+"/"
+          def api(path):
+              req=urllib.request.Request(base+path,headers={"Authorization":"Bearer "+token})
+              try:
+                  with urllib.request.urlopen(req,timeout=30) as r:d=json.load(r)
+                  if not d.get("success"): raise RuntimeError("API failure")
+                  return d.get("result")
+              except urllib.error.HTTPError as e:
+                  print("API_STATUS",path,e.code)
+                  return None
+          for p in ["workers/subdomain","workers/domains"]:
+              x=api(p)
+              print("PUBLIC_CONFIG",p,json.dumps(x))
+          a=api("access/apps?per_page=1")
+          print("ACCESS_AVAILABLE",a is not None)
+          for w in api("workers/scripts") or []:
+              name=w["id"];s=api("workers/scripts/"+name+"/settings") or {}
+              ds=api("workers/scripts/"+name+"/deployments") or {}
+              print("WORKER",json.dumps({"name":name,"binding_types":sorted({b["type"] for b in s.get("bindings",[])}),"own_classes":[b.get("class_name") for b in s.get("bindings",[]) if b.get("type")=="durable_object_namespace" and not b.get("script_name")],"deployments":ds}))
+          for p in api("pages/projects") or []:
+              name=p["name"];d=api("pages/projects/"+name) or {}
+              print("PAGE",json.dumps({"name":name,"subdomain":d.get("subdomain"),"domains":d.get("domains"),"production_branch":d.get("production_branch"),"source_type":(d.get("source") or {}).get("type")}))
