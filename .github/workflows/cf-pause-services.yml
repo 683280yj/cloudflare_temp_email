@@ -1,0 +1,96 @@
+name: Pause Cloudflare services
+on:
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: cloudflare-service-shutdown
+  cancel-in-progress: false
+jobs:
+  shutdown:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Stop services while retaining stored data and recovery versions
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: python
+        run: |
+          import os,json,urllib.request,urllib.error,uuid,sys,time
+          from urllib.parse import quote
+          token=os.environ["CF_TOKEN"]; account=os.environ["CF_ACCOUNT"]
+          base="https://api.cloudflare.com/client/v4/accounts/"+account+"/"
+          failures=[]
+          def api(path,method="GET",data=None,content_type=None):
+              headers={"Authorization":"Bearer "+token}
+              if data is not None:
+                  if not isinstance(data,bytes):data=json.dumps(data).encode()
+                  headers["Content-Type"]=content_type or "application/json"
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(base+path,data=data,headers=headers,method=method),timeout=60) as r:d=json.load(r)
+              except urllib.error.HTTPError as e:
+                  try:err=json.load(e);info=[{"code":x.get("code"),"message":x.get("message")} for x in err.get("errors",[])]
+                  except Exception:info=[]
+                  raise RuntimeError(method+" "+path+": HTTP "+str(e.code)+" "+json.dumps(info))
+              if not d.get("success"):raise RuntimeError(method+" "+path+": API unsuccessful")
+              return d.get("result")
+          def multipart(parts):
+              boundary="offline-"+uuid.uuid4().hex
+              out=[]
+              for name,filename,ctype,value in parts:
+                  out.append(("--"+boundary+"\r\nContent-Disposition: form-data; name=\""+name+"\""+("; filename=\""+filename+"\"" if filename else "")+"\r\nContent-Type: "+ctype+"\r\n\r\n").encode()+value.encode()+b"\r\n")
+              return b"".join(out)+("--"+boundary+"--\r\n").encode(),"multipart/form-data; boundary="+boundary
+          workers=["2fa","bitwadren","cloudflare_temp_email","idky-api","idky-dashboard","may-account","myhealthy","paper","wz-roast"]
+          pages=["may-account","temp-email-pages","cloudflare-imgbed"]
+          if {x["id"] for x in api("workers/scripts")}!=set(workers):raise RuntimeError("Worker inventory changed; refusing unexpected targets")
+          if {x["name"] for x in api("pages/projects")}!=set(pages):raise RuntimeError("Pages inventory changed; refusing unexpected targets")
+          offline='export default {fetch(){return new Response("Service offline",{status:503,headers:{"Content-Type":"text/plain; charset=utf-8","Cache-Control":"no-store"}})},scheduled(){},email(message){message.setReject("Service offline")},queue(batch){for(const m of batch.messages)m.retry({delaySeconds:43200})}};'
+          for name in workers:
+              try:
+                  p="workers/scripts/"+quote(name,safe="")
+                  before=api(p+"/deployments")
+                  print("RECOVERY_WORKER",json.dumps({"name":name,"previous_versions":(before.get("deployments") or [{}])[0].get("versions",[])}),flush=True)
+                  settings=api(p+"/settings")
+                  binding_types=sorted({b["type"] for b in settings.get("bindings",[]) if b["type"]!="assets"})
+                  if any(b.get("type")=="durable_object_namespace" and not b.get("script_name") for b in settings.get("bindings",[])):raise RuntimeError("Unexpected local Durable Object class")
+                  metadata={"main_module":"offline.mjs","compatibility_date":"2026-10-21","keep_bindings":binding_types,"keep_assets":False,"annotations":{"workers/message":"Owner requested shutdown 2026-10-21; original versions retained"}}
+                  payload,ctype=multipart([("metadata",None,"application/json",json.dumps(metadata)),("offline.mjs","offline.mjs","application/javascript+module",offline)])
+                  api(p,"PUT",payload,ctype)
+                  old_subdomain=api(p+"/subdomain")
+                  print("RECOVERY_SUBDOMAIN",json.dumps({"name":name,"settings":old_subdomain}),flush=True)
+                  api(p+"/subdomain","POST",{"enabled":False,"previews_enabled":False})
+                  after=api(p+"/subdomain")
+                  if after.get("enabled") or after.get("previews_enabled"):raise RuntimeError("Public subdomain still enabled")
+                  print("WORKER_OFFLINE",name,flush=True)
+              except Exception as e:
+                  failures.append(name);print("ERROR",name,str(e),flush=True)
+          apps=api("access/apps?per_page=200") or []
+          if isinstance(apps,dict):apps=apps.get("apps",[])
+          for name in pages:
+              try:
+                  project=api("pages/projects/"+name)
+                  print("RECOVERY_PAGE",json.dumps({"name":name,"canonical_deployment_id":(project.get("canonical_deployment") or {}).get("id"),"domains":project.get("domains"),"source_config":(project.get("source") or {}).get("config")}),flush=True)
+                  hosts=sorted(set(project.get("domains",[])+[project["subdomain"],"*."+project["subdomain"]]))
+                  for host in hosts:
+                      matched=next((a for a in apps if a.get("domain")==host or host in (a.get("self_hosted_domains") or [])),None)
+                      policy={"name":"Owner requested service shutdown 2026-10-21","decision":"block","include":[{"everyone":{}}],"precedence":0}
+                      if matched:
+                          result=api("access/apps/"+matched["id"]+"/policies","POST",policy)
+                          print("ACCESS_BLOCK_ADDED",json.dumps({"host":host,"application_id":matched["id"],"policy_id":result["id"]}),flush=True)
+                      else:
+                          result=api("access/apps","POST",{"name":"Offline "+host,"type":"self_hosted","domain":host,"app_launcher_visible":False,"policies":[policy]})
+                          apps.append(result)
+                          print("ACCESS_BLOCK_CREATED",json.dumps({"host":host,"application_id":result["id"]}),flush=True)
+                      aid=(matched or result)["id"]
+                      policies=api("access/apps/"+aid+"/policies") or []
+                      if not any(p.get("decision")=="block" and any("everyone" in x for x in p.get("include",[])) for p in policies):raise RuntimeError("Block-everyone policy verification failed for "+host)
+                  source=project.get("source")
+                  if source and source.get("type") in ["github","gitlab"]:
+                      config=dict(source.get("config") or {})
+                      config.update({"deployments_enabled":False,"production_deployments_enabled":False,"preview_deployment_setting":"none"})
+                      api("pages/projects/"+name,"PATCH",{"source":{"type":source["type"],"config":config}})
+                  print("PAGE_OFFLINE",name,flush=True)
+              except Exception as e:
+                  failures.append(name);print("ERROR",name,str(e),flush=True)
+          print("SHUTDOWN_SUMMARY",json.dumps({"worker_targets":workers,"page_targets":pages,"failures":failures}),flush=True)
+          if failures:sys.exit(1)
